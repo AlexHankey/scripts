@@ -1,67 +1,89 @@
 #!/bin/bash
 
 # ========================
-# VPS Setup Script
+# VPS Setup Script for Nginx + Self-Signed SSL + Firewall
 # ========================
 
-# CONFIGURABLE
-GO_VERSION="1.22.2"
-GO_TARBALL="go$GO_VERSION.linux-amd64.tar.gz"
-GO_URL="https://go.dev/dl/$GO_TARBALL"
+set -e
 
-# ========= Update system =========
+# CONFIG
+VPS_IP="194.164.126.194"
+WEB_ROOT="/var/www/html"
+SSL_CERT="/etc/ssl/certs/selfsigned.crt"
+SSL_KEY="/etc/ssl/private/selfsigned.key"
+NGINX_DEFAULT_CONF="/etc/nginx/sites-available/default"
+
 echo "🔄 Updating package lists..."
 sudo apt update
 
-# ========= Install NGINX =========
-echo "📦 Installing NGINX..."
+echo "📦 Installing Nginx (if not installed)..."
 sudo apt install -y nginx
 
-# ========= Configure UFW =========
-echo "🛡️  Configuring UFW firewall..."
+echo "🛡️ Installing UFW firewall (if not installed)..."
 sudo apt install -y ufw
+
+echo "🛡️ Configuring UFW rules..."
 sudo ufw allow OpenSSH
-sudo ufw allow 'Nginx Full'
+sudo ufw allow http
+sudo ufw allow https
 sudo ufw --force enable
 
-# ========= Remove old Go if exists =========
-echo "🧹 Removing old Go installation..."
-sudo rm -rf /usr/local/go
-
-# ========= Download and install Go =========
-echo "⬇️  Downloading Go $GO_VERSION..."
-wget -q --show-progress $GO_URL
-
-echo "📂 Extracting and installing Go..."
-sudo tar -C /usr/local -xzf $GO_TARBALL
-rm $GO_TARBALL
-
-# ========= Set environment variables =========
-echo "🛠️  Setting Go environment..."
-SHELL_CONFIG="$HOME/.bashrc"
-if [[ $SHELL == *zsh ]]; then
-  SHELL_CONFIG="$HOME/.zshrc"
+if [[ ! -f "$SSL_CERT" ]] || [[ ! -f "$SSL_KEY" ]]; then
+  echo "🔐 Generating self-signed SSL certificate for IP $VPS_IP..."
+  sudo openssl req -x509 -nodes -days 365 \
+    -newkey rsa:2048 \
+    -keyout "$SSL_KEY" \
+    -out "$SSL_CERT" \
+    -subj "/CN=$VPS_IP"
+else
+  echo "🔐 Self-signed SSL certificate already exists, skipping generation."
 fi
 
-{
-  echo ""
-  echo "# Go environment"
-  echo "export PATH=\$PATH:/usr/local/go/bin"
-  echo "export GOPATH=\$HOME/go"
-  echo "export PATH=\$PATH:\$GOPATH/bin"
-} >> "$SHELL_CONFIG"
+echo "🧹 Setting up Nginx configuration..."
 
-source "$SHELL_CONFIG"
+sudo tee "$NGINX_DEFAULT_CONF" > /dev/null << EOF
+# Redirect HTTP to HTTPS
+server {
+    listen 80 default_server;
+    server_name _;
 
-# ========= Create Go workspace =========
-echo "📁 Creating Go workspace..."
-mkdir -p "$HOME/go/"{bin,src,pkg}
+    return 301 https://\$host\$request_uri;
+}
 
-# ========= Final checks =========
+# HTTPS server
+server {
+    listen 443 ssl default_server;
+    server_name _;
+
+    ssl_certificate $SSL_CERT;
+    ssl_certificate_key $SSL_KEY;
+
+    root $WEB_ROOT;
+    index index.html index.htm;
+
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+
+    # Security headers
+    add_header X-Content-Type-Options nosniff;
+    add_header X-Frame-Options DENY;
+    add_header X-XSS-Protection "1; mode=block";
+}
+EOF
+
+echo "📁 Setting ownership and permissions for $WEB_ROOT..."
+sudo chown -R www-data:www-data "$WEB_ROOT"
+sudo chmod -R 755 "$WEB_ROOT"
+
+echo "🔄 Testing Nginx configuration..."
+sudo nginx -t
+
+echo "♻️ Reloading Nginx to apply changes..."
+sudo systemctl reload nginx
+
+echo ""
 echo "✅ Setup complete!"
+echo "👉 Visit your website at: https://$VPS_IP (note: browser will warn about self-signed cert)"
 echo ""
-echo "Go version installed:"
-go version
-echo ""
-echo "UFW status:"
-sudo ufw status
+echo "To replace the self-signed cert with a trusted one, consider using a domain name and Let's Encrypt."
